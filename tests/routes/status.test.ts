@@ -11,6 +11,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const indexerState = vi.hoisted(() => ({
   getIndexerPosition: vi.fn(),
   saveIndexerPosition: vi.fn(),
+  // Only used by health-routes.ts's /ready (see the "alongside the real
+  // /ready route" tests below, which register both route modules together
+  // the way src/index.ts actually does).
+  hasIndexerProgress: vi.fn(),
 }));
 
 const failedEvents = vi.hoisted(() => ({
@@ -21,8 +25,13 @@ const failedEvents = vi.hoisted(() => ({
   failedEventFromDecoded: vi.fn(),
 }));
 
+const db = vi.hoisted(() => ({
+  checkHealth: vi.fn(),
+}));
+
 vi.mock("../../src/repositories/indexer-state.js", () => indexerState);
 vi.mock("../../src/repositories/failed-events.js", () => failedEvents);
+vi.mock("../../src/db.js", () => db);
 
 const { statusRoutes } = await import("../../src/routes/status.js");
 
@@ -146,5 +155,44 @@ describe("GET /status", () => {
     const status = await getStatus();
 
     expect(status.failedEventCount).toBe(12);
+  });
+});
+
+// `statusRoutes` previously defined its own dead, unreachable `/ready` route
+// after its closing brace (issue #448): unreachable because the extra code
+// sat outside the function and couldn't see `app`, and dead because the real
+// `/ready` is already served by registerHealthRoutes (src/health-routes.ts,
+// registered via buildServer in src/server.ts). The syntax error that code
+// produced (TS1128) was masking this: once the brace was naively "fixed" by
+// moving that code inside the function instead of removing it, the app
+// registered `/ready` twice and crashed with "Method 'GET' already declared
+// for route '/ready'" the moment both plugins were registered together, as
+// they actually are in production (src/index.ts registers statusRoutes on
+// the same app buildServer already registered health routes on).
+describe("statusRoutes alongside the real /ready route (#448)", () => {
+  it("registers without colliding with buildServer's /ready route", async () => {
+    const { buildServer } = await import("../../src/server.js");
+    db.checkHealth.mockResolvedValue({ status: "up" });
+    indexerState.getIndexerPosition.mockResolvedValue({
+      lastLedger: 100,
+      chainLedger: 100,
+      cursor: CURSOR,
+      updatedAt: POLLED_AT,
+    });
+    indexerState.hasIndexerProgress.mockReturnValue(true);
+    failedEvents.countFailedEvents.mockResolvedValue(0);
+
+    const app = await buildServer();
+    await expect(app.register(statusRoutes, { startLedger: 0 })).resolves.not.toThrow();
+
+    const statusResponse = await app.inject({ method: "GET", url: "/status" });
+    const readyResponse = await app.inject({ method: "GET", url: "/ready" });
+    await app.close();
+
+    expect(statusResponse.statusCode).toBe(200);
+    // The real /ready (health-routes.ts), not a shape statusRoutes would
+    // produce: { status, database, indexer }, not { ready, lagLedgers }.
+    expect(readyResponse.statusCode).toBe(200);
+    expect(readyResponse.json()).toMatchObject({ status: "ready", database: "up" });
   });
 });

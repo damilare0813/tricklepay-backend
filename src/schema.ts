@@ -17,6 +17,7 @@
 export const STREAM_VIEW_SCHEMA_ID = "StreamView";
 export const STREAM_LIST_RESPONSE_SCHEMA_ID = "StreamListResponse";
 export const STREAM_SUMMARY_RESPONSE_SCHEMA_ID = "StreamSummaryResponse";
+export const STREAM_SCHEDULE_RESPONSE_SCHEMA_ID = "StreamScheduleResponse";
 export const STREAM_EVENT_SCHEMA_ID = "StreamEvent";
 export const STREAM_EVENT_HISTORY_RESPONSE_SCHEMA_ID = "StreamEventHistoryResponse";
 export const INDEXER_STATUS_SCHEMA_ID = "IndexerStatus";
@@ -48,6 +49,8 @@ export const streamViewSchema = {
     "cliffTime",
     "cancelled",
     "status",
+    "createdLedger",
+    "updatedLedger",
   ],
   properties: {
     id: {
@@ -131,6 +134,54 @@ export const streamViewSchema = {
       description:
         "Derived lifecycle status: pending (not yet started), streaming (active), " +
         "completed (fully vested), cancelled.",
+    },
+    createdLedger: {
+      type: "integer",
+      description: "Ledger sequence number in which the stream was created on-chain.",
+      examples: [100],
+    },
+    updatedLedger: {
+      type: "integer",
+      description:
+        "Ledger sequence number of the most recent on-chain event applied to this stream.",
+      examples: [200],
+    },
+  },
+} as const;
+
+// ---------------------------------------------------------------------------
+// StreamScheduleResponse — vesting curve points for charting.
+// ---------------------------------------------------------------------------
+export const streamScheduleResponseSchema = {
+  $id: STREAM_SCHEDULE_RESPONSE_SCHEMA_ID,
+  type: "object",
+  description: "Vesting curve schedule points for charting a stream.",
+  required: ["points"],
+  properties: {
+    points: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["time", "amount", "vested"],
+        properties: {
+          time: {
+            type: "string",
+            description: "Point timestamp in Unix seconds (decimal string).",
+            examples: ["1735689600"],
+          },
+          amount: {
+            type: "string",
+            description: "Vested token amount as of this timestamp (uint128, decimal string).",
+            examples: ["50000000000000"],
+          },
+          vested: {
+            type: "string",
+            description: "Vested token amount as of this timestamp (uint128, decimal string).",
+            examples: ["50000000000000"],
+          },
+        },
+      },
+      description: "Evenly spaced schedule points between start and end, with cliff step included.",
     },
   },
 } as const;

@@ -160,7 +160,7 @@ curl http://localhost:3000/docs/yaml > openapi.yaml
 | --- | --- | --- |
 | `GET` | `/` | Service index: name, version, and a list of endpoints. |
 | `GET` | `/health` | Liveness check. Returns 200 with the service version; performs no database read. |
-| `GET` | `/ready` | Readiness check. Verifies database connectivity and reports indexer lag; returns 503 when the database is unavailable. |
+| `GET` | `/ready` | Readiness check. Verifies database connectivity and that the indexer has made progress; returns 503 when the database is unavailable or the indexer has not yet applied any events. |
 | `GET` | `/status` | Indexer progress against the chain. Response includes `Cache-Control: no-store` to prevent stale lag readings. |
 | `GET` | `/streams` | List streams. Query params: `sender`, `recipient`, `token`, `limit`, `offset`, `includeTotal`, `cancelled`, `cursor`. Address filters accept lowercase and padded spellings and are normalized before matching. `total` is only included when `includeTotal=true`; `cancelled` filters by cancellation status when given, and is omitted to return both. |
 
@@ -204,7 +204,7 @@ The `/streams/summary` endpoint returns aggregate counts and exact total amounts
 }
 ```
 
-All amounts are exact integer base units encoded as strings (not JSON numbers) to preserve full 128-bit precision. The response is cached for 30 seconds (`Cache-Control: public, max-age=30`).
+All amounts are exact integer base units encoded as strings (not JSON numbers) to preserve full 128-bit precision. The response is held in-process for the window set by `STREAM_SUMMARY_CACHE_TTL_MS` (2 seconds by default, `0` to disable); `Cache-Control: public, max-age=N` reports the seconds left in that window, so `N` counts down as the cached entry ages — the full window immediately after a fresh computation, `0` at the end of it — and a client's copy never outlives the server's.
 
 **Data Types and Precision**
 - **Amounts** (`totalAmount`, `withdrawn`, `vested`, `withdrawable`, `locked`) are returned as strings holding integer base units.
@@ -297,6 +297,18 @@ curl -s http://localhost:3000/streams/invalid | jq
 ```
 
 ## Health Endpoint Semantics
+
+`/health` is a liveness probe: it returns 200 with the service version and
+performs no database read, so it stays green even when dependencies are down.
+
+`/ready` is a readiness probe and reflects whether the service has usable
+data, not merely whether dependencies answer. It verifies database
+connectivity and that the indexer has made progress — specifically, that
+`IndexerState.lastLedger` has advanced past its initial value, meaning at
+least one event has been applied to Postgres. A freshly started instance that
+has not yet indexed anything returns 503, so traffic is not routed to an
+instance that would serve an empty list. Liveness is unaffected: `/health`
+continues to return 200 regardless of indexer progress.
 
 The service exposes two health endpoints that answer different questions. Wire them to separate probes in your orchestration platform.
 
@@ -413,6 +425,9 @@ npm install
 
 ### Running with Docker Compose
 
+For the image contents, runtime user, entrypoint, and exposed port, see
+[docs/container-image.md](docs/container-image.md).
+
 The repository includes a multi-container setup in `docker-compose.yml` that starts both the PostgreSQL database and the API service (which automatically runs pending database migrations on startup).
 
 #### Environment Variables for Docker
@@ -490,6 +505,30 @@ docker run -d \
 
 The API listens on `http://localhost:3000`.
 For instructions on pointing the indexer and API to a standalone or containerized local Soroban RPC node, see [Running Against a Local Network](docs/local-network.md).
+
+#### Test database (for integration tests)
+
+The integration suite (`npm run test:integration`) needs a real Postgres
+instance, and pointing it at the same database as development risks wiping
+local data (`beforeAll` clears the `Stream` table before the suite runs).
+`docker-compose.yml` includes an opt-in `postgres-test` service, kept out of
+the default `docker compose up` by a `test` profile, with its own container
+name, port (`5433`, not `5432`) and volume (`pgdata-test`, not `pgdata`), so
+it can never collide with or be mistaken for the development database:
+
+```bash
+docker compose --profile test up -d postgres-test
+DATABASE_URL=postgresql://tricklepay_test:tricklepay_test@localhost:5433/tricklepay_test \
+  npx prisma migrate deploy
+DATABASE_URL=postgresql://tricklepay_test:tricklepay_test@localhost:5433/tricklepay_test \
+  npx vitest run --project integration
+```
+
+Stop it independently of the development database with:
+
+```bash
+docker compose --profile test down -v   # -v also drops the pgdata-test volume
+```
 
 ## Failed events table
 
@@ -597,6 +636,21 @@ npm test          # single run, as CI does it
 npm run test:watch
 ```
 
+The integration suite (`npm run test:integration`) is opt-in and needs a real
+Postgres database; see [Test database (for integration
+tests)](#test-database-for-integration-tests) for how to start one without
+touching development data.
+
+### Unused dependency check
+
+Run `npm run depcheck` to scan for dependencies that are not imported anywhere in the codebase. This helps keep the dependency tree lean and reduces install time and audit surface.
+
+```bash
+npm run depcheck
+```
+
+The command uses [depcheck](https://github.com/depcheck/depcheck) and reports both unused dependencies and missing dependencies (imports that are not declared in package.json). Address any findings by either removing the unused dependency or adding the missing one.
+
 They cover the parts of the service that have to agree with something outside
 it: `lib/vesting.ts`, which mirrors the contract's vesting math case for case,
 and `chain/events.ts`, which is decoded from a stored Soroban RPC `getEvents`
@@ -640,15 +694,93 @@ current template — copy it and fill in the required values.
 | `PORT` | No | `3000` | HTTP server listen port. |
 | `HOST` | No | `0.0.0.0` | HTTP server bind address. |
 | `CORS_ORIGIN` | No | - | Allowed browser origin for the web client. |
-| `LOG_LEVEL` | No | `info` | Log verbosity (`trace`, `debug`, `info`, `warn`, `error`, `fatal`). |
+| `LOG_LEVEL` | No | `info` | Log verbosity (`trace`, `debug`, `info`, `warn`, `error`, `fatal`, `silent`). |
+| `LOG_PRETTY` | No | - | Set to `true` for human-readable development logs; requires the `pino-pretty` dev dependency. Output stays JSON when unset. |
 | `BODY_LIMIT` | No | `1048576` | Largest accepted request body in bytes. |
 | `QUERY_STRING_LIMIT` | No | `2048` | Longest accepted URL query string in bytes. |
+| `RATE_LIMIT_MAX` | No | `100` | Maximum requests per client IP in each rate-limit window. Must be greater than zero. |
+| `RATE_LIMIT_WINDOW_MS` | No | `60000` | Length of the fixed rate-limit window in milliseconds. Must be greater than zero. |
 | `TRUSTED_PROXIES` | No | - | Comma-separated list of trusted reverse-proxy addresses or IPv4 CIDR blocks. Forwarded headers are ignored when unset. |
 | `INDEXER_POLL_INTERVAL_MS` | No | `5000` | Milliseconds between polls of the chain. |
 | `INDEXER_BACKOFF_MAX_MS` | No | `60000` | Maximum poll retry delay (ms) on RPC failures. |
 | `INDEXER_START_LEDGER` | No | `0` | Ledger to begin indexing from. `0` starts at the chain's latest ledger. |
 | `INDEXER_MAX_PAGES_PER_TICK` | No | `1000` | Maximum number of event pages fetched per poll tick. |
 | `STREAM_SUMMARY_CACHE_TTL_MS` | No | `2000` | Summary endpoint cache window in milliseconds. Set to `0` to disable caching. |
+
+### Switching to a different contract
+
+`STREAM_CONTRACT_ID` and `INDEXER_START_LEDGER` must be changed together, and
+the previous contract's indexed state must be cleared. Skipping either step
+leaves the service serving stale or mismatched data.
+
+**Why both variables change together:** The indexer resumes from its saved
+cursor on every restart, not from `INDEXER_START_LEDGER` (that value only
+applies when there is no saved position at all, see
+[`IndexerState`](#database-schema)). Changing only `STREAM_CONTRACT_ID` while
+a cursor from the old contract is still saved makes the indexer resume at the
+old contract's ledger position and poll the new contract's RPC for events at
+that position, which is very unlikely to make sense: the new contract was
+most likely deployed at a different, usually later, ledger, and its events
+start from there.
+
+**Why the previous contract's indexed state must be cleared:** `Stream`,
+`IndexedEvent`, and `FailedEvent` all hold rows keyed by data from the old
+contract (`streamId`, `eventId`) with no column recording which contract they
+came from. Leaving them in place after switching means `/streams` and the
+summary endpoint keep serving the old contract's streams alongside (or
+instead of, depending on ID collisions) the new contract's, and the old
+contract's unresolved `FailedEvent` rows keep showing up in
+[failed-event replay](#failed-event-replay) for a contract the service no
+longer indexes.
+
+**Steps:**
+
+1. Stop the service, or at minimum stop the indexer poller, so nothing writes
+   new rows while you clear the old contract's state.
+2. Clear the previously indexed state. Unlike
+   [resetting the local database](#resetting-the-local-database), this must
+   preserve the Prisma migration history. From a machine with `DATABASE_URL`
+   set to the target database:
+   ```bash
+   echo 'TRUNCATE TABLE "Stream", "IndexedEvent", "FailedEvent", "IndexerState";' | \
+     npx prisma db execute --schema prisma/schema.prisma --stdin
+   ```
+   `IndexerState` is included because its saved cursor and ledger position
+   belong to the old contract; truncating it is what makes
+   `INDEXER_START_LEDGER` take effect again on the next startup, per the
+   explanation above.
+3. Set `STREAM_CONTRACT_ID` to the new contract's address (56 characters,
+   starting with `C`).
+4. Choose `INDEXER_START_LEDGER`:
+   - If you know the ledger the new contract was deployed or initialized at,
+     use that ledger (or slightly before it, to be safe against an
+     off-by-one). Starting earlier than necessary only costs extra RPC calls
+     during backfill; starting later risks silently skipping real events.
+   - If you don't know it, use `0`, which starts indexing from the chain's
+     current latest ledger. This misses any events the new contract already
+     emitted before the switch (acceptable when switching to a freshly
+     deployed contract with no prior history; not appropriate when migrating
+     onto a contract that already has activity you need indexed).
+   - The service validates this at startup and refuses to start if
+     `INDEXER_START_LEDGER` is beyond the chain's current head, since no
+     event could ever satisfy that position (see [index.ts](src/index.ts)).
+5. Restart the service.
+
+### Printing the effective configuration
+
+Diagnosing a configuration problem means reasoning about defaults and
+precedence across the table above. `npm run print-config` resolves the same
+`Config` the server would load and prints it as JSON, in the current
+environment, without starting the server:
+
+```
+npm run print-config
+```
+
+`databaseUrl` is redacted (`"[redacted]"`) whenever it carries embedded
+credentials (`postgresql://user:pass@host/db`), so the output is safe to
+paste into a bug report or a chat message. A connection string with no
+embedded credentials is printed as-is.
 
 ### Trusted proxies
 
@@ -704,7 +836,9 @@ parsing step.
 **Log levels**
 
 The valid values for `LOG_LEVEL` are `trace`, `debug`, `info`, `warn`,
-`error`, and `fatal`. The default is `info`, which logs normal operational
+`error`, `fatal`, and `silent`; the spelling is case-insensitive, and any
+other value is rejected at startup with an error that names the variable and
+lists these levels. The default is `info`, which logs normal operational
 events — server start, poll ticks, and stream writes — without the
 high-frequency trace output. Use `debug` or `trace` in development when
 tracing a specific behaviour:
@@ -720,6 +854,47 @@ LOG_LEVEL=trace npm start
 ```json
 {"level":30,"time":1731550800123,"pid":42,"hostname":"worker-1","module":"indexer","msg":"poll complete","lastLedger":56290013,"newEvents":3}
 ```
+
+**Startup configuration line**
+
+The resolved configuration comes from three places — the defaults in
+`src/config.ts`, a `.env` file, and the ambient environment — so the process
+logs what it actually started with as its first line, before anything that
+depends on those values can fail:
+
+```json
+{"level":30,"time":1731550800001,"pid":42,"hostname":"worker-1","msg":"effective configuration","config":{"port":3000,"host":"0.0.0.0","databaseUrl":"postgresql://***:***@db.internal:5432/tricklepay?schema=public","network":"testnet","networkPassphrase":"Test SDF Network ; September 2015","rpcUrl":"https://soroban-testnet.stellar.org","contractId":"CDMB6…","pollIntervalMs":5000,"startLedger":0,"maxBackoffMs":60000,"maxPagesPerTick":1000,"bodyLimit":1048576,"queryStringLimit":2048,"trustedProxies":[]}}
+```
+
+Every field of the `Config` type appears. `DATABASE_URL` is the only one
+carrying a secret: its user and password are replaced with `***`, leaving the
+host, port, database, and parameters, which are what identify the database the
+service is pointed at. A value that cannot be parsed as a URL is logged as
+`[unparseable, redacted]`, since there is no way to tell which part of it is
+the credential.
+
+**Readable logs in development**
+
+Newline-delimited JSON is what a log shipper wants, not what a developer wants
+to read. Set `LOG_PRETTY=true` to route the same records through
+[`pino-pretty`](https://github.com/pinojs/pino-pretty) instead:
+
+```bash
+LOG_PRETTY=true npm run dev
+```
+
+```text
+[12:40:00.123] INFO: poll complete
+    module: "indexer"
+    lastLedger: 56290013
+    newEvents: 3
+```
+
+`pino-pretty` is a dev dependency, so it is absent from a production install
+(`npm ci --omit=dev`, the Docker image). Nothing changes there unless the
+variable is set: when it is set and the package cannot be found, the service
+logs a warning naming `LOG_PRETTY` and keeps emitting JSON rather than failing
+to start.
 
 ### Metrics & alerting
 

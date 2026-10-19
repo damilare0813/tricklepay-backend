@@ -15,6 +15,8 @@ import type { StreamEvent } from "../chain/events.js";
 
 import { prisma } from "../db.js";
 
+import { failedEventBacklog } from "../metrics.js";
+
 export interface FailedEventInput {
   // The RPC event id — unique per event on chain and used as the primary key.
   eventId: string;
@@ -50,7 +52,19 @@ export async function recordFailedEvent(input: FailedEventInput): Promise<void> 
 
 // Returns the total count of unresolved failed events.
 export async function countFailedEvents(): Promise<number> {
-  return prisma.failedEvent.count();
+  const count = await prisma.failedEvent.count();
+  failedEventBacklog.set(count);
+  return count;
+}
+
+// Refresh telemetry without allowing a metrics-only query failure to interrupt
+// indexing or replay after the underlying event operation has completed.
+export async function refreshFailedEventBacklog(): Promise<void> {
+  try {
+    await countFailedEvents();
+  } catch {
+    // Keep the last observed gauge value until the database is reachable again.
+  }
 }
 
 // Removes the failed-event row for an event that subsequently applied cleanly.
@@ -83,4 +97,39 @@ export function failedEventFromDecoded(
     ledger: event.ledger,
     error: error instanceof Error ? error.message : String(error),
   };
+}
+
+export interface PruneFailedEventsOptions {
+  olderThan: Date;
+  dryRun?: boolean;
+}
+
+export interface PruneFailedEventsResult {
+  deletedCount: number;
+  dryRun: boolean;
+  cutoff: Date;
+}
+
+// Prunes failed events whose firstFailedAt timestamp is older than the given cutoff.
+// In dry-run mode, counts the eligible records without deleting them.
+export async function pruneFailedEvents(
+  options: PruneFailedEventsOptions,
+): Promise<PruneFailedEventsResult> {
+  const { olderThan: cutoff, dryRun = false } = options;
+  if (dryRun) {
+    const count = await prisma.failedEvent.count({
+      where: {
+        firstFailedAt: { lt: cutoff },
+      },
+    });
+    return { deletedCount: count, dryRun: true, cutoff };
+  }
+
+  const result = await prisma.failedEvent.deleteMany({
+    where: {
+      firstFailedAt: { lt: cutoff },
+    },
+  });
+  await refreshFailedEventBacklog();
+  return { deletedCount: result.count, dryRun: false, cutoff };
 }

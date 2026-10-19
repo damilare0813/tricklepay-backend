@@ -12,7 +12,7 @@ try {
   // No .env file found; rely on the ambient environment.
 }
 
-const NETWORK_PASSTHRASES: Record<string, string> = {
+const NETWORK_PASSPHRASES: Record<string, string> = {
   testnet: "Test SDF Network ; September 2015",
   mainnet: "Public Global Stellar Network ; September 2015",
 };
@@ -63,6 +63,12 @@ export const DEFAULT_MAX_PAGES_PER_TICK = 1000;
 // Summary aggregates are expensive and commonly polled, so cache them briefly.
 export const DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS = 2_000;
 
+// Default request rate limit: 100 requests per client IP per 60-second
+// window, matching docs/request-size-limits.md. Used by loadConfig below and
+// by server.ts when registering the rate-limit plugin.
+export const DEFAULT_RATE_LIMIT_MAX = 100;
+export const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
+
 function positiveInteger(name: string, fallback: number, min: number): number {
   const raw = process.env[name];
   if (!raw || raw.trim() === "") return fallback;
@@ -78,12 +84,26 @@ function positiveInteger(name: string, fallback: number, min: number): number {
   return parsed;
 }
 
-// Returns true when the URL resolves to a loopback address (localhost or
-// 127.x.x.x). These are the only hosts for which plain HTTP is acceptable.
+// Returns true when the URL resolves to a loopback address: localhost, an
+// IPv4 address in the 127.0.0.0/8 loopback range, or the IPv6 loopback ::1.
+// These are the only hosts for which plain HTTP is acceptable. The hostname
+// must be a *loopback address itself*; a public hostname that merely begins
+// with "127." (e.g. 127.evil.com) is not local, so it cannot be reached over
+// plain HTTP.
 export function isLocalUrl(url: string): boolean {
   try {
+    // WHATWG URLs keep the brackets in the hostname of IPv6 literals, so
+    // http://[::1]:8000 yields "[::1]".
     const { hostname } = new URL(url);
-    return hostname === "localhost" || hostname === "127.0.0.1" || hostname.startsWith("127.");
+    if (hostname === "localhost" || hostname === "[::1]" || hostname === "::1") {
+      return true;
+    }
+    const octets = hostname.split(".");
+    return (
+      octets.length === 4 &&
+      octets[0] === "127" &&
+      octets.slice(1).every((octet) => /^\d+$/.test(octet) && Number(octet) <= 255)
+    );
   } catch {
     return false;
   }
@@ -96,7 +116,7 @@ function validateRpcUrl(url: string): void {
   if (url.startsWith("http://") && !isLocalUrl(url)) {
     throw new Error(
       `SOROBAN_RPC_URL "${url}" uses plain HTTP on a non-local host. ` +
-        `Remote endpoints must use HTTPS. Use http:// only for localhost or 127.x.x.x.`,
+        `Remote endpoints must use HTTPS. Use http:// only for localhost, 127.x.x.x or [::1].`,
     );
   }
 }
@@ -143,11 +163,13 @@ export interface Config {
   readonly bodyLimit: number;
   readonly queryStringLimit: number;
   readonly trustedProxies: readonly string[];
+  readonly rateLimitMax?: number;
+  readonly rateLimitWindowMs?: number;
 }
 
 export function loadConfig(): Config {
   const network = optional("NETWORK", "testnet");
-  const networkPassphrase = NETWORK_PASSPHRASES[Network];
+  const networkPassphrase = NETWORK_PASSPHRASES[network];
   if (!networkPassphrase) {
     throw new Error(`Unknown NETWORK "${network}"; expected "testnet" or "mainnet"`);
   }
@@ -157,6 +179,15 @@ export function loadConfig(): Config {
 
   const contractId = required("STREAM_CONTRACT_ID");
   validateContractId(contractId);
+
+  const rateLimitMax = integer("RATE_LIMIT_MAX", DEFAULT_RATE_LIMIT_MAX);
+  if (rateLimitMax === 0) {
+    throw new Error("RATE_LIMIT_MAX must be greater than zero");
+  }
+  const rateLimitWindowMs = integer("RATE_LIMIT_WINDOW_MS", DEFAULT_RATE_LIMIT_WINDOW_MS);
+  if (rateLimitWindowMs === 0) {
+    throw new Error("RATE_LIMIT_WINDOW_MS must be greater than zero");
+  }
 
   return {
     port: integer("PORT", 3000),
@@ -186,5 +217,83 @@ export function loadConfig(): Config {
     queryStringLimit: integer("QUERY_STRING_LIMIT", 2048), // 2KB default
     // Forwarded headers are honored only for these direct peers (#75).
     trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
+    rateLimitMax,
+    rateLimitWindowMs,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Startup reporting (#474).
+//
+// When the service misbehaves the first question is what configuration it
+// actually started with, and the answer is spread across the defaults above, a
+// `.env` file, and the ambient environment. `describeConfig` renders the
+// resolved values for a single startup log line, with the database credentials
+// removed.
+// ---------------------------------------------------------------------------
+
+// Query parameters that carry a secret in a Postgres connection string.
+const CREDENTIAL_QUERY_PARAMS = ["password", "sslpassword"];
+
+// Replaces the credentials in a database URL with a placeholder, keeping the
+// parts that identify the server (scheme, host, port, database) so the line
+// still answers "which database is this pointed at?".
+export function redactDatabaseUrl(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    // Nothing can be said about where credentials sit in a value that is not a
+    // URL, so none of it is logged.
+    return "[unparseable, redacted]";
+  }
+
+  // A value with no authority component ("indexer:secret@host/db", which parses
+  // as an opaque "indexer:" URL) has no field to redact, and the secret in it
+  // would otherwise pass through untouched.
+  if (parsed.host === "") return "[unparseable, redacted]";
+
+  if (parsed.username !== "") parsed.username = "***";
+  if (parsed.password !== "") parsed.password = "***";
+  for (const param of CREDENTIAL_QUERY_PARAMS) {
+    if (parsed.searchParams.has(param)) parsed.searchParams.set(param, "***");
+  }
+
+  return parsed.toString();
+}
+
+// The configuration as it is logged: every field of `Config`, with the
+// database URL narrowed to its redacted rendering. Mapped over `keyof Config`
+// so a field added to `Config` fails to type check until it is given a place
+// here, which keeps the startup line from quietly falling behind.
+// Mapped over `Required<Config>` rather than `Config`, so a field `Config`
+// declares optional (the rate-limit settings) still has to be named below
+// instead of silently dropping out of the line; the value may still be
+// undefined, which pino omits from the output.
+export type LoggedConfig = {
+  [K in keyof Required<Config>]: K extends "databaseUrl" ? string : Config[K] | undefined;
+};
+
+export function describeConfig(config: Config): LoggedConfig {
+  return {
+    port: config.port,
+    host: config.host,
+    // The only field carrying a secret.
+    databaseUrl: redactDatabaseUrl(config.databaseUrl),
+    network: config.network,
+    networkPassphrase: config.networkPassphrase,
+    rpcUrl: config.rpcUrl,
+    contractId: config.contractId,
+    pollIntervalMs: config.pollIntervalMs,
+    startLedger: config.startLedger,
+    maxBackoffMs: config.maxBackoffMs,
+    maxPagesPerTick: config.maxPagesPerTick,
+    summaryCacheTtlMs: config.summaryCacheTtlMs,
+    bodyLimit: config.bodyLimit,
+    queryStringLimit: config.queryStringLimit,
+    trustedProxies: config.trustedProxies,
+    // Undefined when rate limiting is not configured; pino omits the field.
+    rateLimitMax: config.rateLimitMax,
+    rateLimitWindowMs: config.rateLimitWindowMs,
   };
 }

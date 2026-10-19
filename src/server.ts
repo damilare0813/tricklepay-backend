@@ -13,7 +13,13 @@ import Fastify, {
 
 import { swaggerConfig, swaggerUiConfig } from "./api-spec.js";
 
-import type { Config } from "./config.js";
+import {
+  DEFAULT_RATE_LIMIT_MAX,
+  DEFAULT_RATE_LIMIT_WINDOW_MS,
+  type Config,
+} from "./config.js";
+
+import { errorCodeForStatus } from "./error-redaction.js";
 
 import { registerErrorHandlers } from "./error-handlers.js";
 
@@ -36,7 +42,7 @@ import { registerSharedSchemas } from "./schemas.js";
 // Request-id sanitisation lives in `./request-id.ts`, the echo hook in
 // `./request-id-hook.ts`, error redaction in `./error-redaction.ts`, error
 // handlers in `./error-handlers.ts`, shared schemas in `./schemas.ts`, and
-// health routes in `./health-routes.ts` — all independently testable.
+// health routes in `./health-routes.ts` â€” all independently testable.
 
 // Builds the Fastify instance with the shared logger, CORS, the OpenAPI
 // plugin, and the routes that do not depend on external services. Route groups
@@ -48,6 +54,8 @@ import { registerSharedSchemas } from "./schemas.js";
 // with $ref and the plugin emits them as reusable OpenAPI components.
 export async function buildServer(config?: Partial<Config>): Promise<FastifyInstance> {
   const trustedProxies = config?.trustedProxies ?? [];
+  const rateLimitMax = config?.rateLimitMax ?? DEFAULT_RATE_LIMIT_MAX;
+  const rateLimitWindowMs = config?.rateLimitWindowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS;
   const app = Fastify({
     // Fastify types its logger as FastifyBaseLogger; the pino instance
     // satisfies that interface at runtime.
@@ -68,6 +76,11 @@ export async function buildServer(config?: Partial<Config>): Promise<FastifyInst
     genReqId: (req) =>
       sanitizeRequestId(req.headers[REQUEST_ID_HEADER]) ?? randomUUID(),
     querystringParser: parseQueryString,
+    // Fastify's default Ajv strips properties a schema forbids with
+    // `additionalProperties: false`. Turn that off so an unknown or misspelt
+    // query parameter (`limt=5`) is rejected with a 400 instead of silently
+    // changing paging results.
+    ajv: { customOptions: { removeAdditional: false } },
   });
 
   // Enforce the query string length limit before routing.
@@ -81,6 +94,46 @@ export async function buildServer(config?: Partial<Config>): Promise<FastifyInst
       });
       return reply;
     }
+  });
+
+  const clientWindows = new Map<string, { requests: number; resetAt: number }>();
+  const maxTrackedClients = 10_000;
+
+  app.addHook("onRequest", async (request, reply) => {
+    const now = Date.now();
+    let window = clientWindows.get(request.ip);
+
+    if (!window || window.resetAt <= now) {
+      if (window) {
+        clientWindows.delete(request.ip);
+      } else if (clientWindows.size >= maxTrackedClients) {
+        for (const [ip, trackedWindow] of clientWindows) {
+          if (trackedWindow.resetAt <= now) clientWindows.delete(ip);
+        }
+        if (clientWindows.size >= maxTrackedClients) {
+          const oldestIp = clientWindows.keys().next().value;
+          if (oldestIp !== undefined) clientWindows.delete(oldestIp);
+        }
+      }
+      window = { requests: 0, resetAt: now + rateLimitWindowMs };
+    }
+
+    clientWindows.delete(request.ip);
+    clientWindows.set(request.ip, window);
+
+    if (window.requests >= rateLimitMax) {
+      const retryAfter = Math.max(1, Math.ceil((window.resetAt - now) / 1000));
+      return reply
+        .header("Retry-After", String(retryAfter))
+        .status(429)
+        .send({
+          code: errorCodeForStatus(429),
+          error: "rate limit exceeded",
+          requestId: request.id,
+        });
+    }
+
+    window.requests += 1;
   });
 
   // Echo the request id header on every response.

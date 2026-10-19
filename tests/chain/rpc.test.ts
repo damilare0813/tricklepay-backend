@@ -48,6 +48,7 @@ function configWith(rpcUrl: string): Config {
     bodyLimit: 1048576,
     queryStringLimit: 2048,
     trustedProxies: [],
+    summaryCacheTtlMs: 2000,
   };
 }
 

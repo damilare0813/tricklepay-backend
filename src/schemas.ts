@@ -13,6 +13,7 @@ import {
   apiIndexSchema,
   indexerStatusSchema,
   streamListResponseSchema,
+  streamScheduleResponseSchema,
   streamSummaryResponseSchema,
   streamViewSchema,
 } from "./schema.js";
@@ -25,6 +26,7 @@ export function registerSharedSchemas(app: FastifyInstance): void {
   app.addSchema(streamViewSchema);
   app.addSchema(streamListResponseSchema);
   app.addSchema(streamSummaryResponseSchema);
+  app.addSchema(streamScheduleResponseSchema);
   app.addSchema(indexerStatusSchema);
   app.addSchema(apiErrorSchema);
   app.addSchema(apiIndexSchema);

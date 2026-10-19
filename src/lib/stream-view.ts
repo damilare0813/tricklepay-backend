@@ -37,10 +37,11 @@ function statusOf(stream: Stream, now: bigint): StreamStatus {
  * 128-bit precision used by the contract.
  *
  * @param stream - The raw stream row from the database.
+ * @param asOfTime - Optional Unix timestamp in seconds to evaluate derived vesting fields at.
  * @returns The API-ready view object matching the `StreamView` JSON Schema.
  */
-export function mapStreamResponse(stream: Stream) {
-  const now = nowSeconds();
+export function mapStreamResponse(stream: Stream, asOfTime?: bigint) {
+  const now = typeof asOfTime === "bigint" ? asOfTime : nowSeconds();
   const total = BigInt(stream.totalAmount.toString());
   const withdrawn = BigInt(stream.withdrawn.toString());
   const vested = vestedAmount(total, stream.startTime, stream.endTime, stream.cliffTime, now);
@@ -65,6 +66,8 @@ export function mapStreamResponse(stream: Stream) {
     cliffTime: stream.cliffTime.toString(),
     cancelled: stream.cancelled,
     status: statusOf(stream, now),
+    createdLedger: stream.createdLedger,
+    updatedLedger: stream.updatedLedger,
   };
 }
 

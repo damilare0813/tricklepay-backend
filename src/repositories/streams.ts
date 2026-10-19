@@ -11,6 +11,7 @@
 import { Prisma, type Stream } from "@prisma/client";
 
 import { prisma, withQueryTimeout } from "../db.js";
+import { indexedStreams } from "../metrics.js";
 
 export interface UpsertStreamInput {
   streamId: bigint;
@@ -184,7 +185,11 @@ export async function insertStream(input: InsertStreamInput, tx: Prisma.Transact
     skipDuplicates: true,
   });
 
-  return result.count > 0 ? "applied" : "duplicate";
+  if (result.count > 0) {
+    indexedStreams.inc();
+    return "applied";
+  }
+  return "duplicate";
 }
 
 // Applies a `withdrawn` event as a delta on the stored row. The event carries
@@ -257,6 +262,8 @@ export async function getStream({ streamId }: { streamId: bigint }): Promise<Str
   return withQueryTimeout(prisma.stream.findUnique({ where: { streamId } }));
 }
 
+// Repository naming convention: use `get` for one record, `list` for
+// collections, `count` for totals, and action verbs for mutations.
 function whereFromFilter(filter: StreamFilter): Prisma.StreamWhereInput {
   const where: Prisma.StreamWhereInput = {};
   if (filter.sender) where.sender = filter.sender;

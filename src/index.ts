@@ -1,6 +1,6 @@
 import { createRpcServer, verifyRpcEndpoint } from "./chain/rpc.js";
 
-import { loadConfig } from "./config.js";
+import { describeConfig, loadConfig, validateStartLedger } from "./config.js";
 
 import { disconnect } from "./db.js";
 
@@ -22,15 +22,15 @@ import { createShutdown } from "./shutdown.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  // The resolved configuration, before anything that depends on it can fail,
+  // so a startup failure is diagnosed against the values that caused it (#474).
+  logger.info({ config: describeConfig(config) }, "effective configuration");
+
   const rpcServer = createRpcServer(config);
   await verifyRpcEndpoint(rpcServer, config.rpcUrl);
 
   const chainHead = await rpcServer.getLatestLedger();
-  if (config.startLedger > chainHead) {
-    throw new Error(
-      `start ledger ${config.startLedger} is beyond the chain head ${chainHead}; no events will ever be indexed. Set START_LEGGER to a value at or below the current chain head.`,
-    );
-  }
+  validateStartLedger(config.startLedger, chainHead.sequence);
 
   const app = await buildServer(config);
   await app.register(rootRoutes(config));

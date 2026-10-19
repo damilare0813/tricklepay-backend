@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_MAX_BACKOFF_MS,
   DEFAULT_MAX_PAGES_PER_TICK,
+  DEFAULT_RATE_LIMIT_MAX,
+  DEFAULT_RATE_LIMIT_WINDOW_MS,
   DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS,
   MIN_POLL_INTERVAL_MS,
   isLocalUrl,
@@ -58,6 +60,11 @@ describe("isLocalUrl", () => {
   it("accepts other 127.x.x.x addresses", () => {
     expect(isLocalUrl("http://127.0.0.2:8000")).toBe(true);
     expect(isLocalUrl("http://127.1.2.3")).toBe(true);
+    expect(isLocalUrl("http://127.5.5.5")).toBe(true);
+  });
+
+  it("accepts the IPv6 loopback", () => {
+    expect(isLocalUrl("http://[::1]:8000")).toBe(true);
   });
 
   it("rejects a public hostname", () => {
@@ -75,6 +82,11 @@ describe("isLocalUrl", () => {
 
   it("is not confused by a hostname that merely contains '127'", () => {
     expect(isLocalUrl("http://host127.example.com")).toBe(false);
+  });
+
+  it("rejects a public hostname that merely begins with '127.'", () => {
+    expect(isLocalUrl("http://127.evil.com/rpc")).toBe(false);
+    expect(isLocalUrl("http://127.0.0.1.attacker.io/rpc")).toBe(false);
   });
 });
 
@@ -109,9 +121,17 @@ describe("loadConfig — default values for unset optional settings", () => {
           bodyLimit: 1048576,
           queryStringLimit: 2048,
           trustedProxies: [],
+          rateLimitMax: DEFAULT_RATE_LIMIT_MAX,
+          rateLimitWindowMs: DEFAULT_RATE_LIMIT_WINDOW_MS,
         });
       },
     );
+  });
+
+  it("loads custom request rate limits", () => {
+    withEnv({ RATE_LIMIT_MAX: "25", RATE_LIMIT_WINDOW_MS: "30000" }, () => {
+      expect(loadConfig()).toMatchObject({ rateLimitMax: 25, rateLimitWindowMs: 30000 });
+    });
   });
 
   it("switches the default RPC URL to the selected network", () => {

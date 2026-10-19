@@ -28,11 +28,14 @@ import {
   STREAM_EVENT_SCHEMA_ID,
   streamListResponseSchema,
   STREAM_LIST_RESPONSE_SCHEMA_ID,
+  streamScheduleResponseSchema,
+  STREAM_SCHEDULE_RESPONSE_SCHEMA_ID,
   streamSummaryResponseSchema,
   STREAM_SUMMARY_RESPONSE_SCHEMA_ID,
   streamViewSchema,
   STREAM_VIEW_SCHEMA_ID,
 } from "../schema.js";
+import { vestedAmount } from "../lib/vesting.js";
 import { listIndexedEvents } from "../repositories/indexed-events.js";
 import { nowSeconds } from "../lib/time.js";
 import { DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS } from "../config.js";
@@ -62,6 +65,81 @@ function parseStreamId(raw: string | undefined): bigint | null {
   } catch {
     return null;
   }
+}
+
+function parseAtTimestamp(raw: string | undefined): bigint | null {
+  if (raw === undefined) return null;
+
+  const value = raw.trim();
+  if (value.length === 0 || !/^\d+$/.test(value)) return null;
+
+  try {
+    const parsed = BigInt(value);
+    if (parsed < 0n || parsed > MAX_UINT64) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+const DEFAULT_SCHEDULE_POINTS = 50;
+const MIN_SCHEDULE_POINTS = 2;
+const MAX_SCHEDULE_POINTS = 100;
+
+function computeSchedulePoints(stream: Stream, targetPoints = DEFAULT_SCHEDULE_POINTS) {
+  const count = Math.max(MIN_SCHEDULE_POINTS, Math.min(targetPoints, MAX_SCHEDULE_POINTS));
+  const startTime = stream.startTime;
+  const endTime = stream.endTime;
+  const cliffTime = stream.cliffTime;
+  const total = BigInt(stream.totalAmount.toString());
+
+  if (endTime <= startTime) {
+    const v = vestedAmount(total, startTime, endTime, cliffTime, startTime);
+    return [
+      {
+        time: startTime.toString(),
+        amount: v.toString(),
+        vested: v.toString(),
+      },
+    ];
+  }
+
+  const duration = endTime - startTime;
+  const hasCliff = cliffTime > startTime && cliffTime < endTime;
+
+  const candidateTimes = new Set<bigint>();
+  for (let i = 0; i < count; i++) {
+    const t = startTime + (duration * BigInt(i)) / BigInt(count - 1);
+    candidateTimes.add(t);
+  }
+
+  if (hasCliff && !candidateTimes.has(cliffTime)) {
+    let closest: bigint | null = null;
+    let minDiff: bigint | null = null;
+    for (const t of candidateTimes) {
+      if (t === startTime || t === endTime) continue;
+      const diff = t > cliffTime ? t - cliffTime : cliffTime - t;
+      if (minDiff === null || diff < minDiff) {
+        minDiff = diff;
+        closest = t;
+      }
+    }
+    if (closest !== null) {
+      candidateTimes.delete(closest);
+    }
+    candidateTimes.add(cliffTime);
+  }
+
+  const sortedTimes = Array.from(candidateTimes).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+  return sortedTimes.map((t) => {
+    const v = vestedAmount(total, startTime, endTime, cliffTime, t);
+    return {
+      time: t.toString(),
+      amount: v.toString(),
+      vested: v.toString(),
+    };
+  });
 }
 
 function parseCancelled(raw: string | undefined): boolean | undefined {
@@ -126,6 +204,9 @@ export async function streamRoutes(
   if (!app.getSchema(STREAM_EVENT_SCHEMA_ID)) app.addSchema(streamEventSchema);
   if (!app.getSchema(STREAM_EVENT_HISTORY_RESPONSE_SCHEMA_ID)) {
     app.addSchema(streamEventHistoryResponseSchema);
+  }
+  if (!app.getSchema(STREAM_SCHEDULE_RESPONSE_SCHEMA_ID)) {
+    app.addSchema(streamScheduleResponseSchema);
   }
   if (!app.getSchema(ERROR_SCHEMA_ID)) app.addSchema(apiErrorSchema);
 
@@ -268,7 +349,7 @@ export async function streamRoutes(
 
       reply.header("Cache-Control", "public, max-age=30");
       return {
-        streams: listResult.streams.map(mapStreamResponse),
+        streams: listResult.streams.map((s) => mapStreamResponse(s)),
         ...(total === undefined ? {} : { total }),
         ...(listResult.nextCursor === undefined ? {} : { nextCursor: listResult.nextCursor }),
         limit,
@@ -408,6 +489,18 @@ export async function streamRoutes(
             },
           },
         },
+        querystring: {
+          type: "object",
+          properties: {
+            at: {
+              type: "string",
+              description:
+                "Optional Unix timestamp in seconds to calculate vested/derived figures at that point in time.",
+              examples: ["1735689600"],
+            },
+          },
+          additionalProperties: false,
+        },
         response: {
           200: { $ref: STREAM_VIEW_SCHEMA_ID },
           304: { type: "null" },
@@ -423,12 +516,25 @@ export async function streamRoutes(
         return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid stream id");
       }
 
+      const query = request.query as { at?: string };
+      let asOfTime: bigint | undefined;
+      if (query.at !== undefined) {
+        const parsed = parseAtTimestamp(query.at);
+        if (parsed === null) {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid at timestamp");
+        }
+        asOfTime = parsed;
+      }
+
       const stream = await getStream({ streamId });
       if (!stream) {
         return sendError(reply, request, 404, "NOT_FOUND", "stream not found");
       }
 
-      const etag = `"${stream.updatedLedger}"`;
+      const etag =
+        asOfTime !== undefined
+          ? `"${stream.updatedLedger}-${asOfTime}"`
+          : `"${stream.updatedLedger}"`;
       reply.header("Cache-Control", "public, max-age=30");
       reply.header("ETag", etag);
 
@@ -437,7 +543,87 @@ export async function streamRoutes(
         return reply.code(304).send();
       }
 
-      return mapStreamResponse(stream);
+      return mapStreamResponse(stream, asOfTime);
+    },
+  );
+
+  app.get(
+    "/streams/:id/schedule",
+    {
+      schema: {
+        summary: "Get stream vesting schedule",
+        description:
+          "Returns evenly spaced points along the stream's vesting curve between start and end, " +
+          "with the cliff step included, suitable for client-side charting.",
+        tags: ["streams"],
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: {
+              type: "string",
+              description: "Stream id (uint64, decimal string).",
+              examples: ["42"],
+            },
+          },
+        },
+        querystring: {
+          type: "object",
+          properties: {
+            points: {
+              type: "string",
+              description: "Desired number of schedule points (2–100, default 50).",
+              examples: ["50"],
+            },
+          },
+          additionalProperties: false,
+        },
+        response: {
+          200: { $ref: STREAM_SCHEDULE_RESPONSE_SCHEMA_ID },
+          304: { type: "null" },
+          400: { $ref: ERROR_SCHEMA_ID },
+          404: { $ref: ERROR_SCHEMA_ID },
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const streamId = parseStreamId(id);
+      if (streamId === null) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid stream id");
+      }
+
+      const query = request.query as { points?: string; count?: string; limit?: string };
+      const rawPoints = query.points ?? query.count ?? query.limit;
+      let requestedPoints = DEFAULT_SCHEDULE_POINTS;
+      if (rawPoints !== undefined) {
+        const trimmed = rawPoints.trim();
+        if (trimmed.length === 0 || !/^\d+$/.test(trimmed)) {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid points parameter");
+        }
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed) || parsed < 1) {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid points parameter");
+        }
+        requestedPoints = Math.max(MIN_SCHEDULE_POINTS, Math.min(parsed, MAX_SCHEDULE_POINTS));
+      }
+
+      const stream = await getStream({ streamId });
+      if (!stream) {
+        return sendError(reply, request, 404, "NOT_FOUND", "stream not found");
+      }
+
+      const etag = `"${stream.updatedLedger}-schedule-${requestedPoints}"`;
+      reply.header("Cache-Control", "public, max-age=30");
+      reply.header("ETag", etag);
+
+      const ifNoneMatch = request.headers["if-none-match"];
+      if (ifNoneMatch === etag) {
+        return reply.code(304).send();
+      }
+
+      const points = computeSchedulePoints(stream, requestedPoints);
+      return { points };
     },
   );
 }

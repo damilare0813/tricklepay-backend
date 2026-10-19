@@ -35,6 +35,7 @@ const indexer = vi.hoisted(() => ({ applyEvent: vi.fn() }));
 const failedEvents = vi.hoisted(() => ({
   recordFailedEvent: vi.fn(),
   clearFailedEvent: vi.fn(),
+  refreshFailedEventBacklog: vi.fn(),
   failedEventFromDecoded: vi.fn((event: unknown, err: unknown) => ({ eventId: "x", kind: "created", streamId: "1", ledger: 0, error: String(err) })),
 }));
 
@@ -76,6 +77,7 @@ const config: Config = {
   bodyLimit: 1048576,
   queryStringLimit: 2048,
   trustedProxies: [],
+  summaryCacheTtlMs: 2000,
 };
 
 const log = pino({ level: "silent" });
@@ -112,6 +114,7 @@ beforeEach(() => {
   indexer.applyEvent.mockResolvedValue("applied");
   failedEvents.recordFailedEvent.mockResolvedValue(undefined);
   failedEvents.clearFailedEvent.mockResolvedValue(undefined);
+  failedEvents.refreshFailedEventBacklog.mockResolvedValue(undefined);
   getLatestLedger.mockResolvedValue({ sequence: CHAIN_HEAD });
 });
 
@@ -129,6 +132,7 @@ describe("Poller", () => {
       chainLedger: CHAIN_HEAD,
       cursor: CURSOR,
     });
+    expect(failedEvents.refreshFailedEventBacklog).toHaveBeenCalled();
   });
 
   it("does not credit itself for events it could not decode", async () => {

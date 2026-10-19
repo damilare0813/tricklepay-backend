@@ -10,6 +10,7 @@ import { getIndexerPosition } from "../repositories/indexer-state.js";
 import { INDEXER_STATUS_SCHEMA_ID, indexerStatusSchema } from "../schema.js";
 
 // The default TTL for the server-side status cache. Kept short (2 s) so
+
 // monitoring tools get a reasonably fresh view without hammering the database
 // on every poll. The value is exported so tests can pass a custom TTL and
 // exercise expiry without sleeping for the production window.
@@ -29,7 +30,7 @@ type StatusPayload = {
 };
 
 // Simple in-process TTL cache: one slot, refreshed whenever the entry is older
-// than `ttlMs`. Extracted as a factory so each plugin registration gets its own
+// than `ttlM`'. Extracted as a factory so each plugin registration gets its own
 // independent cache, which keeps tests isolated from one another.
 function makeStatusCache(ttlMs: number) {
   let cachedAt = -Infinity;
@@ -63,6 +64,9 @@ export type StatusRoutesOptions = {
 // of the indexer's last completed poll. `updatedAt` is when that was: an
 // indexer that has stopped leaves a lag that no longer grows, and this is what
 // tells that apart from one that is genuinely level.
+//
+// Readiness is served separately by `/ready` (see registerHealthRoutes in
+// health-routes.ts), not by this module.
 export async function statusRoutes(
   app: FastifyInstance,
   opts: StatusRoutesOptions = {},
@@ -85,7 +89,7 @@ export async function statusRoutes(
           200: { $ref: INDEXER_STATUS_SCHEMA_ID },
         },
       },
-    },
+},
     async (_request, reply) => {
       const now = Date.now();
       const hit = cache.get(now);
@@ -121,4 +125,3 @@ export async function statusRoutes(
     },
   );
 }
-
